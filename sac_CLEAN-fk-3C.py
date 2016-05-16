@@ -1,6 +1,13 @@
 # Control script for CLEAN-fk-3c
 #    by Martin Gal
-#    2016 - Jan - 15
+#    2016 - May - 16
+#
+#
+# For more info on the algorithm, see (doi: 10.1093/gji/ggw150)
+# 'Deconvolution enhanced direction of arrival estimation using 
+#  1- and 3-component seismic arrays applied to ocean induced microseisms'
+#
+#
 #
 # Python modules needed:
 # Obspy, numpy,scipy, matplotlib
@@ -10,19 +17,20 @@
 # functions used:
 # ---------------
 # read                   ... obspy read function
-# get_metadata           ... reads metadata from standard iris output
 # equalize               ... checks if there are equal amout of traces and if all stations are in the correct order
-# metric_mseed           ... generates coordinates for the stations
+# get_rxy_sac            ... extracts station locations from the SAC header (st[x].stats.sac.stla/stlo)
 # remove_gain            ... removes gain, i.e. conversion to m/s
-# PSAR_dict()            ... azimuth for BH1 component of PSAR, returns dictionary with station name and angle
-# make_subwindows_PSAR   ... makes subwindows with data, mean removed and Hann taper applied
+# make_subwindows        ... makes subwindows with data, mean removed and Hann taper applied
 # make_csdm              ... generates the cross spectral density matrix
-# CLEAN_3C_Capon         ... CLEAN procedure
-# np.linalg.inv          ... numpy routine to get inverse matrix
-# make_P_Capon           ... 3 component beamformer
+# CLEAN_3C_fk            ... CLEAN procedure
+# make_P_fk              ... 3 component beamformer
 # get_max                ... extracts maxima of strongest source on each component
 # make_plot              ... Plots the beamforming results
-
+# refine_max             ... Runs a nested grid to find a more accurate slowness vector which is used for clean iterations
+#
+#
+#
+#
 # variables used:
 # ---------------
 # nsamp          ... amount of data points in a temporal subwindow
@@ -58,29 +66,52 @@
 # pdic           ... dictionary with BH1 azimuth directions. (this is made specifically for the philbara array /PSAR)
 # xt             ... data split into temporal subwindows, mean removed and Hann taper applied.
 # csdm           ... cross spectral density matrix
-# icsdm          ... inverse csdm
 # fk_cln         ... clean power spectrum 
 # polariz        ... power output for Z,R,T component
 # max_c          ... xy-slowness of stronges source in polariz [s/deg,s/deg]x3
 # max_o          ... power of strongest source in polariz 
-# tt1, tt2, tt3  ... clean + background spectra for all 3 components
 # Z,R,T          ... normalized power components [dB]
+# Z,R,T          ... normalized power components [dB]
+# src_grd_ref    ... source grid refinement, how often to refine grid in the search of a maximum.
+#                    refinment ends up at: sinc/float((src_grd_ref)**2)
+# min_relative_pow ... minimum in relative power [dB], for plotting
+# enhance_vis      ... if true, CLEAN spectrum is convolved with a Gauss kernel for for better looks
+# add_bg           ... adds background to the cleaned spectrum, can be useful if the spectrum is only parially cleaned. 
+#                      Power measurements have to be taken with care though. Summation over (clean+bg spectrum) is not a viable option anymore to calculate the total power oa a component.
+# inter_mode       ... Want interpolation of your plot? 'nearest' = none, or any other from here:
+#                      http://matplotlib.org/examples/images_contours_and_fields/interpolation_methods.html
+# area             ... size of gauss kernel to be convelved with CLEAN-spectrum (size as in pixel, area x area)
+# std_g            ... standard deviation of guassian kernel, controls the extent of the kernel
+# show_clean_hist  ... switch to show slowness vector removal per iteration per component. 
+#                  ... useful to check if your results are stabil.
+# pwrZ             ... power on the Z component from autocorrelations
 
 import numpy as np
 from obspy import read
 from subroutine_CLEAN_3c import *
 
 
+
 nsamp          = 8000 
 smin           = -40.0
 smax           = 40.0
-sinc           = 0.5
+sinc           = 1
 find           = 60
 fave           = 3
 control        = 0.1
 cln_iter       = 0
-show_peak_info = True
 
+
+
+src_grd_ref      = 5
+show_peak_info   = False
+show_clean_hist  = False # this option is best used with a small control parameter and a high cln_iter value
+min_relative_pow = -12         
+enhance_vis      = True        
+add_bg           = False                                                           
+inter_mode       = 'bilinear'      
+area             = 7           
+std_g            = 1           
 
 
 
@@ -110,38 +141,61 @@ print 'npts:',st0[0].count()
 print 'Amount of stations:', nr
 print 'CLEAN-Capon-3C DOA estimation is performed at:','freq',freq,'+-',fave/float(nsamp*dt)
 
-pdic = PSAR_dict()
+
 xt = make_subwindows(nr,nwin,st,st0,st1,nsamp)
 csdm = make_csdm(nwin,nr,xt,nsamp,find,fave)
-icsdm = np.zeros((3,3*nr,3*nr),dtype=complex)
 fk_cln = np.zeros((3,nk,nk))
+print
+pwrZ = 10*np.log10(np.trace(csdm[0,:nr,:nr]).real) 
 
 for cln in range(cln_iter+1):
     if cln != 0:
-        csdm,fk_cln = CLEAN_3C_Capon(nr,max_c,smin,sinc,freq,rx,ry,csdm,control,fk_cln,cln,nk,show_peak_info)   
-    for k in range(3):
-        icsdm[k] = np.linalg.inv(csdm[k]) 
-    polariz = make_P_Capon(nk,nr,kinc,kmin,rx,ry,icsdm)
+        csdm,fk_cln = CLEAN_3C_fk(nr,max_c,smin,sinc,freq,rx,ry,csdm,control,fk_cln,cln,nk,show_peak_info)   
+
+    polariz = make_P_fk(nk,nr,kinc,kmin,rx,ry,csdm)
     max_c, max_o = get_max(polariz,smin,sinc,cln)
+    if src_grd_ref > 0:
+        max_c = refine_max_fk(src_grd_ref,polariz,nk,nr,rx,ry,csdm,max_c,smin,sinc,freq)
+    if show_clean_hist == True:
+        cln_hist.append(max_c)
 
-tt1 = (fk_cln[0] + polariz[:,:,0] )
-tt2 = (fk_cln[1] + polariz[:,:,1] )
-tt3 = (fk_cln[2] + polariz[:,:,2] )
 
-Z = (tt1/tt1.max())
-R = (tt2/tt2.max())
-T = (tt3/tt3.max())
+Z = (fk_cln[0])
+R = (fk_cln[1])
+T = (fk_cln[2])
 
-print '-------------------------'
-print 'Power info for strongest source:'
-print 'Total   %.02f dB'%(10*np.log10((tt1+tt2+tt3).max()))
-print 'Z-comp  %.02f dB'%(10*np.log10(tt1.max()))
-print 'R-comp  %.02f dB'%(10*np.log10(tt2.max()))
-print 'T-comp  %.02f dB'%(10*np.log10(tt3.max()))
-print '-------------------------'
 
-make_plot(Z,R,T,smin,smax)
+print 'Power estimation form Z component autocorrelations: %.02f [dB]'%(pwrZ)
+print 'This value includes every signal on the component, i.e. also signals'
+print 'that do not pass as plain wave over the array, or noise, glitches and local stuff. '
+print 'Hence this value will always be higher than the extracted CLEAN signal.'
+if cln_iter > 0 :
+	print '-------------------------'
+	print 'Power info for strongest cleaned-source (grid size dependent):'
+	print 'Total   %.02f dB'%(10*np.log10((Z+R+T).max()))
+	print 'Z-comp  %.02f dB'%(10*np.log10(Z.max()))
+	print 'R-comp  %.02f dB'%(10*np.log10(R.max()))
+	print 'T-comp  %.02f dB'%(10*np.log10(T.max()))
+	print '-------------------------'
+	print
+	print '-------------------------'
+	print 'Power info for total cleaned power on each component:'
+	print '(If power of Z from autocorrelations is smaller than' 
+	print 'CLEAN power, either your step or iteration parameter'
+	print 'is to large check with show_clean_hist=True)'
+	print 'Total   %.02f dB'%(10*np.log10((Z+R+T).sum()))
+	print 'Z-comp  %.02f dB'%(10*np.log10(Z.sum()))
+	print 'R-comp  %.02f dB'%(10*np.log10(R.sum()))
+	print 'T-comp  %.02f dB'%(10*np.log10(T.sum()))
+	print '-------------------------'
 
+if add_bg==True or cln_iter==0:
+    Z = (fk_cln[0] + polariz[:,:,0])
+    R = (fk_cln[1] + polariz[:,:,1])
+    T = (fk_cln[2] + polariz[:,:,2])
+if show_clean_hist == True:
+	plt_hist(cln_hist,cln_iter)
+make_plot(Z,R,T,smin,smax,min_relative_pow,enhance_vis,inter_mode,area,std_g)
 
 
 

@@ -1,0 +1,10 @@
+As you can see, the iteration count of 150
+is too large for the radial and transverse 
+component and there are peaks with higher
+velocities there are basically removed 
+noise. The vertical component is still 
+fine with the iteration count. The correct
+approach would be to use different iteration
+numbers for each component. I leave that 
+to you to split up the script if that needs
+to be done, or email me if need be.
